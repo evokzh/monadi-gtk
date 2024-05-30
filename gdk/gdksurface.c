@@ -1165,12 +1165,16 @@ gdk_surface_get_egl_surface (GdkSurface *self)
   return priv->egl_surface;
 }
 
+#define MAX_EGL_CREATE_SURFACE_ATTRIBS 10
+
 GdkMemoryDepth
 gdk_surface_ensure_egl_surface (GdkSurface     *self,
                                 GdkMemoryDepth  depth)
 {
   GdkSurfacePrivate *priv = gdk_surface_get_instance_private (self);
   GdkDisplay *display = gdk_surface_get_display (self);
+  EGLint surface_attribs[MAX_EGL_CREATE_SURFACE_ATTRIBS];
+  int i = 0;
 
   g_return_val_if_fail (priv->egl_native_window != NULL, depth);
 
@@ -1191,9 +1195,16 @@ gdk_surface_ensure_egl_surface (GdkSurface     *self,
       priv->egl_surface = NULL;
     }
 
+  if (display->have_egl_nv_post_sub_buffer)
+    {
+      surface_attribs[i++] = EGL_POST_SUB_BUFFER_SUPPORTED_NV;
+      surface_attribs[i++] = EGL_TRUE;
+    }
+
+  surface_attribs[i++] = EGL_NONE;
   if (priv->egl_surface == NULL)
     {
-      EGLint attribs[4];
+      EGLint attribs[MAX_EGL_CREATE_SURFACE_ATTRIBS];
       int i;
 
       i = 0;
@@ -1202,6 +1213,12 @@ gdk_surface_ensure_egl_surface (GdkSurface     *self,
           attribs[i++] = EGL_GL_COLORSPACE_KHR;
           attribs[i++] = EGL_GL_COLORSPACE_SRGB_KHR;
           self->is_srgb = TRUE;
+        }
+
+      if (display->have_egl_nv_post_sub_buffer)
+        {
+          attribs[i++] = EGL_POST_SUB_BUFFER_SUPPORTED_NV;
+          attribs[i++] = EGL_TRUE;
         }
       g_assert (i < G_N_ELEMENTS (attribs));
       attribs[i++] = EGL_NONE;
