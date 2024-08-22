@@ -130,7 +130,7 @@ typedef struct
   GPollFD event_poll_fd;
 } GdkWin32EventSource;
 
-static GSourceFuncs event_funcs = {
+static const GSourceFuncs event_funcs = {
   gdk_event_prepare,
   gdk_event_check,
   gdk_event_dispatch,
