@@ -617,6 +617,7 @@ _gdk_macos_toplevel_surface_constructed (GObject *object)
 
   _gdk_macos_surface_set_native (GDK_MACOS_SURFACE (self), window);
 
+  [window setBackgroundColor:[NSColor clearColor]];
   /* Allow NSWindow to go fullscreen */
   [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 
