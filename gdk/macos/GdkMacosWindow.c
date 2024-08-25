@@ -228,6 +228,9 @@ typedef NSString *CALayerContentsGravity;
 	                            defer:flag
                              screen:screen];
 
+  [self setOpaque:NO];
+  [self setBackgroundColor:[NSColor clearColor]];
+
   [self setAcceptsMouseMovedEvents:YES];
   [self setDelegate:(id<NSWindowDelegate>)self];
   [self setReleasedWhenClosed:YES];
