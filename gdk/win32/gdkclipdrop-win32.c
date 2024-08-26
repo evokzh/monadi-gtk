@@ -279,6 +279,7 @@ Otherwise it's similar to how the clipboard works. Only the DnD server
 #include "gdkclipboardprivate.h"
 #include "gdkclipboard-win32.h"
 #include "gdkclipdrop-win32.h"
+#include "gdkdisplay-win32.h"
 #include "gdkhdataoutputstream-win32.h"
 #include "gdkwin32dnd.h"
 #include "gdkwin32dnd-private.h"
@@ -299,12 +300,6 @@ Otherwise it's similar to how the clipboard works. Only the DnD server
  * before that happens.
  */
 #define CLIPBOARD_RENDER_TIMEOUT (G_USEC_PER_SEC * 29)
-
-gboolean _gdk_win32_transmute_windows_data (UINT          from_w32format,
-                                            const char   *to_contentformat,
-                                            HANDLE        hdata,
-                                            guchar      **set_data,
-                                            gsize        *set_data_length);
 
 /* Just to avoid calling RegisterWindowMessage() every time */
 static UINT thread_wakeup_message;
@@ -485,7 +480,7 @@ _gdk_win32_format_uses_hdata (UINT w32format)
 static gboolean
 clipboard_hwnd_created (gpointer user_data)
 {
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_display_get_default ());
 
   clipdrop->clipboard_hwnd = (HWND) user_data;
 
@@ -518,7 +513,7 @@ clipboard_render_hdata_ready (GObject      *clipboard,
 {
   GError *error = NULL;
   GdkWin32ClipboardRenderAndStream render_and_stream = *(GdkWin32ClipboardRenderAndStream *) user_data;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_clipboard_get_clipdrop (GDK_CLIPBOARD (clipboard));
 
   g_free (user_data);
 
@@ -553,11 +548,11 @@ static gboolean
 clipboard_render (gpointer user_data)
 {
   GdkWin32ClipboardThreadRender *render = (GdkWin32ClipboardThreadRender *) user_data;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
   GdkDisplay *display = gdk_display_get_default ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (display);
   GdkClipboard *clipboard = gdk_display_get_clipboard (display);
   GError *error = NULL;
-  GOutputStream *stream = gdk_win32_hdata_output_stream_new (&render->pair, &error);
+  GOutputStream *stream = gdk_win32_hdata_output_stream_new (clipdrop, &render->pair, &error);
   GdkWin32ClipboardRenderAndStream *render_and_stream;
 
   if (stream == NULL)
@@ -910,7 +905,8 @@ grab_data_from_hdata (GdkWin32ClipboardThreadRetrieve *retr,
 }
 
 static gboolean
-process_retrieve (GdkWin32ClipboardThreadRetrieve *retr)
+process_retrieve (GdkWin32ClipboardThreadRetrieve *retr,
+                  GdkWin32Clipdrop                *clipdrop)
 {
   DWORD error_code;
   int i;
@@ -1021,7 +1017,7 @@ process_retrieve (GdkWin32ClipboardThreadRetrieve *retr)
     }
   else
     {
-      _gdk_win32_transmute_windows_data (pair->w32format, pair->contentformat, hdata, &data, &data_len);
+      gdk_win32_clipdrop_transmute_windows_data (clipdrop, pair->w32format, pair->contentformat, hdata, &data, &data_len);
 
       if (data == NULL)
         return FALSE;
@@ -1040,7 +1036,7 @@ process_retrieve (GdkWin32ClipboardThreadRetrieve *retr)
 }
 
 static gboolean
-process_clipboard_queue ()
+process_clipboard_queue (GdkWin32Clipdrop *clipdrop)
 {
   GdkWin32ClipboardThreadQueueItem *placeholder;
   GList *p;
@@ -1058,7 +1054,7 @@ process_clipboard_queue ()
           try_again = process_advertise ((GdkWin32ClipboardThreadAdvertise *) placeholder);
           break;
         case GDK_WIN32_CLIPBOARD_THREAD_QUEUE_ITEM_RETRIEVE:
-          try_again = process_retrieve ((GdkWin32ClipboardThreadRetrieve *) placeholder);
+          try_again = process_retrieve ((GdkWin32ClipboardThreadRetrieve *) placeholder, clipdrop);
           break;
         case GDK_WIN32_CLIPBOARD_THREAD_QUEUE_ITEM_STORE:
           try_again = process_store ((GdkWin32ClipboardThreadStore *) placeholder);
@@ -1080,7 +1076,7 @@ process_clipboard_queue ()
           try_again = process_advertise ((GdkWin32ClipboardThreadAdvertise *) placeholder);
           break;
         case GDK_WIN32_CLIPBOARD_THREAD_QUEUE_ITEM_RETRIEVE:
-          try_again = process_retrieve ((GdkWin32ClipboardThreadRetrieve *) placeholder);
+          try_again = process_retrieve ((GdkWin32ClipboardThreadRetrieve *) placeholder, clipdrop);
           break;
         case GDK_WIN32_CLIPBOARD_THREAD_QUEUE_ITEM_STORE:
           try_again = process_store ((GdkWin32ClipboardThreadStore *) placeholder);
@@ -1128,6 +1124,7 @@ inner_clipboard_hwnd_procedure (HWND   hwnd,
       message == WM_TIMER)
     {
       gboolean queue_is_empty = FALSE;
+      GdkWin32Clipdrop *clipdrop = (GdkWin32Clipdrop *)GetWindowLongPtr (hwnd, GWLP_USERDATA);
 
       if (clipboard_thread_data == NULL)
         {
@@ -1135,7 +1132,7 @@ inner_clipboard_hwnd_procedure (HWND   hwnd,
           return DefWindowProcW (hwnd, message, wparam, lparam);
         }
 
-      queue_is_empty = process_clipboard_queue ();
+      queue_is_empty = process_clipboard_queue (clipdrop);
 
       if (queue_is_empty && clipboard_thread_data->wakeup_timer)
         {
@@ -1169,6 +1166,13 @@ inner_clipboard_hwnd_procedure (HWND   hwnd,
 
   switch (message)
     {
+    case WM_CREATE:
+      {
+        CREATESTRUCT *cs = (CREATESTRUCT *)lparam;
+        GdkWin32Clipdrop *clipdrop = (GdkWin32Clipdrop *)cs->lpCreateParams;
+        SetWindowLongPtr (hwnd, GWLP_USERDATA, (LONG_PTR)clipdrop);
+        return 0;
+      }
     case WM_DESTROY: /* unregister the clipboard listener */
       {
         if (clipboard_thread_data == NULL)
@@ -1403,7 +1407,7 @@ _clipboard_hwnd_procedure (HWND   hwnd,
  * Creates a hidden HWND and add a clipboard listener
  */
 static gboolean
-register_clipboard_notification ()
+register_clipboard_notification (GdkWin32Clipdrop *clipdrop)
 {
   WNDCLASS wclass = { 0, };
   ATOM klass;
@@ -1420,7 +1424,7 @@ register_clipboard_notification ()
   clipboard_thread_data->clipboard_hwnd = CreateWindow (MAKEINTRESOURCE (klass),
                                                 NULL, WS_POPUP,
                                                 0, 0, 0, 0, NULL, NULL,
-                                                this_module (), NULL);
+                                                this_module (), clipdrop);
 
   if (clipboard_thread_data->clipboard_hwnd == NULL)
     goto failed;
@@ -1443,11 +1447,20 @@ failed:
   return FALSE;
 }
 
+struct _clipdrop_thread_items
+{
+  GdkWin32Clipdrop *clipdrop;
+  GAsyncQueue *queue;
+};
+
+typedef struct _clipdrop_thread_items clipdrop_thread_items;
+
 static gpointer
 _gdk_win32_clipboard_thread_main (gpointer data)
 {
   MSG msg;
-  GAsyncQueue *queue = (GAsyncQueue *) data;
+  clipdrop_thread_items *items = (clipdrop_thread_items*) data;
+  GAsyncQueue *queue = items->queue;
   GAsyncQueue *render_queue = (GAsyncQueue *) g_async_queue_pop (queue);
 
   g_assert (clipboard_thread_data == NULL);
@@ -1457,7 +1470,7 @@ _gdk_win32_clipboard_thread_main (gpointer data)
   clipboard_thread_data->render_queue = render_queue;
   clipboard_thread_data->clipboard_opened_for = INVALID_HANDLE_VALUE;
 
-  if (!register_clipboard_notification ())
+  if (!register_clipboard_notification (items->clipdrop))
     {
       g_async_queue_unref (queue);
       g_clear_pointer (&clipboard_thread_data, g_free);
@@ -1487,12 +1500,6 @@ gdk_win32_clipdrop_class_init (GdkWin32ClipdropClass *klass)
 {
 }
 
-void
-_gdk_win32_clipdrop_init (void)
-{
-  _win32_clipdrop = GDK_WIN32_CLIPDROP (g_object_new (GDK_TYPE_WIN32_CLIPDROP, NULL));
-}
-
 static void
 gdk_win32_clipdrop_init (GdkWin32Clipdrop *win32_clipdrop)
 {
@@ -1504,6 +1511,7 @@ gdk_win32_clipdrop_init (GdkWin32Clipdrop *win32_clipdrop)
   GArray             *comp;
   GdkWin32ContentFormatPair fmt;
   HMODULE                   user32;
+  clipdrop_thread_items *items = g_new0 (clipdrop_thread_items, 1);
 
   thread_wakeup_message = RegisterWindowMessage (L"GDK_WORKER_THREAD_WEAKEUP");
 
@@ -1797,9 +1805,12 @@ gdk_win32_clipdrop_init (GdkWin32Clipdrop *win32_clipdrop)
    * pointers and then passing *that* to the thread.
    */
   g_async_queue_push (win32_clipdrop->clipboard_open_thread_queue, g_async_queue_ref (win32_clipdrop->clipboard_render_queue));
+  items->clipdrop = win32_clipdrop;
+  items->queue = g_async_queue_ref (win32_clipdrop->clipboard_open_thread_queue);
   win32_clipdrop->clipboard_open_thread = g_thread_new ("GDK Win32 Clipboard Thread",
                                                         _gdk_win32_clipboard_thread_main,
-                                                        g_async_queue_ref (win32_clipdrop->clipboard_open_thread_queue));
+                                                        items);
+  g_free (items);
 
   win32_clipdrop->dnd_queue = g_async_queue_new ();
   win32_clipdrop->dnd_thread = g_thread_new ("GDK Win32 DnD Thread",
@@ -1926,11 +1937,11 @@ _gdk_win32_get_clipboard_format_name_as_interned_mimetype (char *w32format_name)
 }
 
 static GArray *
-get_compatibility_w32formats_for_contentformat (const char *contentformat)
+get_compatibility_w32formats_for_contentformat (GdkWin32Clipdrop *clipdrop,
+                                                const char       *contentformat)
 {
   GArray *result = NULL;
   int i;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
 
   result = g_hash_table_lookup (clipdrop->compatibility_w32formats, contentformat);
 
@@ -1944,7 +1955,7 @@ get_compatibility_w32formats_for_contentformat (const char *contentformat)
 
       /* Any format known to gdk-pixbuf can be presented as PNG or BMP */
       result = g_hash_table_lookup (clipdrop->compatibility_w32formats,
-                                    _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_PNG));
+                                    _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_PNG));
       break;
     }
 
@@ -1952,10 +1963,10 @@ get_compatibility_w32formats_for_contentformat (const char *contentformat)
 }
 
 static GArray *
-_gdk_win32_get_compatibility_contentformats_for_w32format (UINT w32format)
+_gdk_win32_get_compatibility_contentformats_for_w32format (GdkWin32Clipdrop *clipdrop,
+                                                           UINT              w32format)
 {
   GArray *result = NULL;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
 
   result = g_hash_table_lookup (clipdrop->compatibility_contentformats, GINT_TO_POINTER (w32format));
 
@@ -1982,9 +1993,10 @@ _gdk_win32_get_compatibility_contentformats_for_w32format (UINT w32format)
  * (builder already takes care of that for itself).
  */
 void
-_gdk_win32_add_w32format_to_pairs (UINT                      w32format,
-                                   GArray                   *pairs,
-                                   GdkContentFormatsBuilder *builder)
+gdk_win32_clipdrop_add_win32_format_to_pairs (GdkWin32Clipdrop         *clipdrop,
+                                              UINT                      w32format,
+                                              GArray                   *pairs,
+                                              GdkContentFormatsBuilder *builder)
 {
   gboolean predef;
   char *w32format_name = _gdk_win32_get_clipboard_format_name (w32format, &predef);
@@ -2016,7 +2028,7 @@ _gdk_win32_add_w32format_to_pairs (UINT                      w32format,
         gdk_content_formats_builder_add_mime_type (builder, interned_w32format_name);
     }
 
-  comp_pairs = _gdk_win32_get_compatibility_contentformats_for_w32format (w32format);
+  comp_pairs = _gdk_win32_get_compatibility_contentformats_for_w32format (clipdrop, w32format);
 
  if (pairs != NULL && comp_pairs != NULL)
    for (i = 0; i < comp_pairs->len; i++)
@@ -2547,11 +2559,12 @@ transmute_image_bmp_to_cf_dib (const guchar    *data,
 }
 
 gboolean
-_gdk_win32_transmute_windows_data (UINT          from_w32format,
-                                   const char   *to_contentformat,
-                                   HANDLE        hdata,
-                                   guchar      **set_data,
-                                   gsize        *set_data_length)
+gdk_win32_clipdrop_transmute_windows_data (GdkWin32Clipdrop  *clipdrop,
+                                           UINT               from_w32format,
+                                           const char        *to_contentformat,
+                                           HANDLE             hdata,
+                                           guchar           **set_data,
+                                           gsize             *set_data_length)
 {
   const guchar *data;
   SIZE_T hdata_length;
@@ -2571,37 +2584,37 @@ _gdk_win32_transmute_windows_data (UINT          from_w32format,
 
   length = (gsize) hdata_length;
 
-  if ((to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_PNG) &&
-       from_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_PNG)) ||
-      (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_JPEG) &&
-       from_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_JFIF)) ||
-      (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_GIF) &&
-       from_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_GIF)))
+  if ((to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_PNG) &&
+       from_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_PNG)) ||
+      (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_JPEG) &&
+       from_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_JFIF)) ||
+      (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_GIF) &&
+       from_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_GIF)))
     {
       /* No transmutation needed */
       *set_data = g_memdup2 (data, length);
       *set_data_length = length;
     }
-  else if (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
+  else if (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
            from_w32format == CF_UNICODETEXT)
     {
       transmute_cf_unicodetext_to_utf8_string (data, length, set_data, set_data_length, NULL);
       res = TRUE;
     }
-  else if (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
+  else if (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
            from_w32format == CF_TEXT)
     {
       transmute_cf_text_to_utf8_string (data, length, set_data, set_data_length, NULL);
       res = TRUE;
     }
-  else if (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
+  else if (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
            (from_w32format == CF_DIB || from_w32format == CF_DIBV5))
     {
       transmute_cf_dib_to_image_bmp (data, length, set_data, set_data_length, NULL);
       res = TRUE;
     }
-  else if (to_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_URI_LIST) &&
-           from_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_CFSTR_SHELLIDLIST))
+  else if (to_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_URI_LIST) &&
+           from_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_CFSTR_SHELLIDLIST))
     {
       transmute_cf_shell_id_list_to_text_uri_list (data, length, set_data, set_data_length, NULL);
       res = TRUE;
@@ -2620,47 +2633,48 @@ out:
 }
 
 gboolean
-_gdk_win32_transmute_contentformat (const char    *from_contentformat,
-                                    UINT           to_w32format,
-                                    const guchar  *data,
-                                    gsize          length,
-                                    guchar       **set_data,
-                                    gsize         *set_data_length)
+gdk_win32_clipdrop_transmute_contentformat (GdkWin32Clipdrop  *clipdrop,
+                                            const char        *from_contentformat,
+                                            UINT               to_w32format,
+                                            const guchar      *data,
+                                            gsize              length,
+                                            guchar           **set_data,
+                                            gsize             *set_data_length)
 {
-  if ((from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_PNG) &&
-       to_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_PNG)) ||
-      (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_JPEG) &&
-       to_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_JFIF)) ||
-      (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_GIF) &&
-       to_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_GIF)))
+  if ((from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_PNG) &&
+       to_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_PNG)) ||
+      (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_JPEG) &&
+       to_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_JFIF)) ||
+      (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_GIF) &&
+       to_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_GIF)))
     {
       /* No conversion needed */
       *set_data = g_memdup2 (data, length);
       *set_data_length = length;
     }
-  else if (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
+  else if (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
            to_w32format == CF_UNICODETEXT)
     {
       transmute_utf8_string_to_cf_unicodetext (data, length, set_data, set_data_length, NULL);
     }
-  else if (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
+  else if (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_PLAIN_UTF8) &&
            to_w32format == CF_TEXT)
     {
       transmute_utf8_string_to_cf_text (data, length, set_data, set_data_length, NULL);
     }
-  else if (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
+  else if (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
            to_w32format == CF_DIB)
     {
       transmute_image_bmp_to_cf_dib (data, length, set_data, set_data_length, NULL);
     }
-  else if (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
+  else if (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_IMAGE_BMP) &&
            to_w32format == CF_DIBV5)
     {
       transmute_image_bmp_to_cf_dib (data, length, set_data, set_data_length, NULL);
     }
 /*
-  else if (from_contentformat == _gdk_win32_clipdrop_atom (GDK_WIN32_ATOM_INDEX_TEXT_URI_LIST) &&
-           to_w32format == _gdk_win32_clipdrop_cf (GDK_WIN32_CF_INDEX_CFSTR_SHELLIDLIST))
+  else if (from_contentformat == _gdk_win32_clipdrop_atom (clipdrop, GDK_WIN32_ATOM_INDEX_TEXT_URI_LIST) &&
+           to_w32format == _gdk_win32_clipdrop_cf (clipdrop, GDK_WIN32_CF_INDEX_CFSTR_SHELLIDLIST))
     {
       transmute_text_uri_list_to_shell_id_list (data, length, set_data, set_data_length, NULL);
     }
@@ -2676,8 +2690,9 @@ _gdk_win32_transmute_contentformat (const char    *from_contentformat,
 }
 
 int
-_gdk_win32_add_contentformat_to_pairs (const char *contentformat,
-                                       GArray     *array)
+_gdk_win32_add_contentformat_to_pairs (GdkWin32Clipdrop *clip_drop,
+                                       const char       *contentformat,
+                                       GArray           *array)
 {
   int added_count = 0;
   wchar_t *contentformat_w;
@@ -2722,7 +2737,7 @@ _gdk_win32_add_contentformat_to_pairs (const char *contentformat,
   g_array_append_val (array, fmt);
   added_count += 1;
 
-  comp_pairs = get_compatibility_w32formats_for_contentformat (contentformat);
+  comp_pairs = get_compatibility_w32formats_for_contentformat (clip_drop, contentformat);
   for (i = 0; comp_pairs != NULL && i < comp_pairs->len; i++)
     {
       int j;
@@ -2746,10 +2761,11 @@ _gdk_win32_add_contentformat_to_pairs (const char *contentformat,
 }
 
 void
-_gdk_win32_advertise_clipboard_contentformats (GTask             *task,
+_gdk_win32_advertise_clipboard_contentformats (GdkClipboard      *cb,
+                                               GTask             *task,
                                                GdkContentFormats *contentformats)
 {
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_clipboard_get_display (cb));
   GdkWin32ClipboardThreadAdvertise *adv = g_new0 (GdkWin32ClipboardThreadAdvertise, 1);
   const char * const *mime_types;
   gsize mime_types_len;
@@ -2774,7 +2790,7 @@ _gdk_win32_advertise_clipboard_contentformats (GTask             *task,
       mime_types = gdk_content_formats_get_mime_types (contentformats, &mime_types_len);
 
       for (i = 0; i < mime_types_len; i++)
-        _gdk_win32_add_contentformat_to_pairs (mime_types[i], adv->pairs);
+        _gdk_win32_add_contentformat_to_pairs (clipdrop, mime_types[i], adv->pairs);
     }
 
   g_async_queue_push (clipdrop->clipboard_open_thread_queue, adv);
@@ -2784,10 +2800,11 @@ _gdk_win32_advertise_clipboard_contentformats (GTask             *task,
 }
 
 void
-_gdk_win32_retrieve_clipboard_contentformats (GTask             *task,
+_gdk_win32_retrieve_clipboard_contentformats (GdkClipboard      *cb,
+                                              GTask             *task,
                                               GdkContentFormats *contentformats)
 {
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_clipboard_get_display (cb));
   GdkWin32ClipboardThreadRetrieve *retr = g_new0 (GdkWin32ClipboardThreadRetrieve, 1);
   const char * const *mime_types;
   gsize mime_types_len;
@@ -2805,7 +2822,7 @@ _gdk_win32_retrieve_clipboard_contentformats (GTask             *task,
   mime_types = gdk_content_formats_get_mime_types (contentformats, &mime_types_len);
 
   for (i = 0; i < mime_types_len; i++)
-    _gdk_win32_add_contentformat_to_pairs (mime_types[i], retr->pairs);
+    _gdk_win32_add_contentformat_to_pairs (clipdrop, mime_types[i], retr->pairs);
 
   g_async_queue_push (clipdrop->clipboard_open_thread_queue, retr);
   API_CALL (PostMessage, (clipdrop->clipboard_hwnd, thread_wakeup_message, 0, 0));
@@ -2878,7 +2895,7 @@ clipboard_store_hdata_ready (GObject      *clipboard,
   if (!no_other_streams)
     return;
 
-  clipdrop = _gdk_win32_clipdrop_get ();
+  clipdrop = gdk_win32_clipboard_get_clipdrop (GDK_CLIPBOARD (clipboard));
 
   store = g_new0 (GdkWin32ClipboardThreadStore, 1);
 
@@ -2903,7 +2920,7 @@ _gdk_win32_store_clipboard_contentformats (GdkClipboard      *cb,
   const char * const *mime_types;
   gsize n_mime_types;
   gsize i;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_clipboard_get_display (cb));
   GdkWin32ClipboardStorePrep *prep;
 
   g_assert (clipdrop->clipboard_hwnd != NULL);
@@ -2916,7 +2933,7 @@ _gdk_win32_store_clipboard_contentformats (GdkClipboard      *cb,
                              n_mime_types);
 
   for (i = 0; i < n_mime_types; i++)
-    _gdk_win32_add_contentformat_to_pairs (mime_types[i], pairs);
+    _gdk_win32_add_contentformat_to_pairs (clipdrop, mime_types[i], pairs);
 
   if (pairs->len <= 0)
     {
@@ -2934,7 +2951,7 @@ _gdk_win32_store_clipboard_contentformats (GdkClipboard      *cb,
       GdkWin32ClipboardStorePrepElement el;
       GdkWin32ContentFormatPair *pair = &g_array_index (pairs, GdkWin32ContentFormatPair, i);
 
-      el.stream = gdk_win32_hdata_output_stream_new (pair, NULL);
+      el.stream = gdk_win32_hdata_output_stream_new (clipdrop, pair, NULL);
 
       if (!el.stream)
         continue;

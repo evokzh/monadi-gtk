@@ -368,21 +368,21 @@ struct _GdkWin32DnDThread
 static GdkWin32DnDThread *dnd_thread_data = NULL;
 
 static gboolean
-dnd_queue_is_empty ()
+dnd_queue_is_empty (GdkDisplay *display)
 {
-  return g_atomic_int_get (&_win32_clipdrop->dnd_queue_counter) == 0;
+  return g_atomic_int_get (&(gdk_win32_display_get_clipdrop (display)->dnd_queue_counter)) == 0;
 }
 
 static void
-decrement_dnd_queue_counter ()
+decrement_dnd_queue_counter (GdkDisplay *display)
 {
-  g_atomic_int_dec_and_test (&_win32_clipdrop->dnd_queue_counter);
+  g_atomic_int_dec_and_test (&(gdk_win32_display_get_clipdrop (display)->dnd_queue_counter));
 }
 
 static void
-increment_dnd_queue_counter ()
+increment_dnd_queue_counter (GdkDisplay *display)
 {
-  g_atomic_int_inc (&_win32_clipdrop->dnd_queue_counter);
+  g_atomic_int_inc (&(gdk_win32_display_get_clipdrop (display)->dnd_queue_counter));
 }
 
 static void
@@ -427,7 +427,8 @@ free_queue_item (GdkWin32DnDThreadQueueItem *item)
 }
 
 static gboolean
-process_dnd_queue (gboolean                   timed,
+process_dnd_queue (GdkDrag                   *drag,
+                   gboolean                   timed,
                    guint64                    end_time,
                    GdkWin32DnDThreadGetData  *getdata_check)
 {
@@ -454,7 +455,7 @@ process_dnd_queue (gboolean                   timed,
       if (item == NULL)
         break;
 
-      decrement_dnd_queue_counter ();
+      decrement_dnd_queue_counter (gdk_surface_get_display (GDK_WIN32_DRAG (drag)->drag_surface));
 
       switch (item->item_type)
         {
@@ -490,7 +491,7 @@ do_drag_drop_response (gpointer user_data)
   HRESULT hr = ddd->received_result;
   GdkDrag *drag = GDK_DRAG (ddd->base.opaque_context);
   GdkWin32Drag *drag_win32 = GDK_WIN32_DRAG (drag);
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (drag_win32->drag_surface));
   gpointer table_value = g_hash_table_lookup (clipdrop->active_source_drags, drag);
 
   if (ddd == table_value)
@@ -546,7 +547,7 @@ received_drag_context_data (GObject      *drag,
 {
   GError *error = NULL;
   GdkWin32DnDThreadGetData *getdata = (GdkWin32DnDThreadGetData *) user_data;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (GDK_WIN32_DRAG (drag)->drag_surface));
 
   if (!gdk_drag_write_finish (GDK_DRAG (drag), result, &error))
     {
@@ -571,7 +572,7 @@ received_drag_context_data (GObject      *drag,
     }
 
   g_clear_object (&getdata->stream);
-  increment_dnd_queue_counter ();
+  increment_dnd_queue_counter (gdk_surface_get_display (GDK_WIN32_DRAG (drag)->drag_surface));
   g_async_queue_push (clipdrop->dnd_queue, getdata);
   API_CALL (PostThreadMessage, (clipdrop->dnd_thread_id, thread_wakeup_message, 0, 0));
 }
@@ -580,8 +581,8 @@ static gboolean
 get_data_response (gpointer user_data)
 {
   GdkWin32DnDThreadGetData *getdata = (GdkWin32DnDThreadGetData *) user_data;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
   GdkDrag *drag = GDK_DRAG (getdata->base.opaque_context);
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (GDK_WIN32_DRAG (getdata->base.opaque_context)->drag_surface));
   gpointer ddd = g_hash_table_lookup (clipdrop->active_source_drags, drag);
 
   GDK_NOTE (DND, g_print ("idataobject_getdata will request target 0x%p (%s)",
@@ -593,7 +594,7 @@ get_data_response (gpointer user_data)
   if (ddd)
     {
       GError *error = NULL;
-      GOutputStream *stream = gdk_win32_hdata_output_stream_new (&getdata->pair, &error);
+      GOutputStream *stream = gdk_win32_hdata_output_stream_new (clipdrop, &getdata->pair, &error);
 
       if (stream)
         {
@@ -610,7 +611,7 @@ get_data_response (gpointer user_data)
         }
     }
 
-  increment_dnd_queue_counter ();
+  increment_dnd_queue_counter (gdk_surface_get_display (GDK_WIN32_DRAG (drag)->drag_surface));
   g_async_queue_push (clipdrop->dnd_queue, getdata);
   API_CALL (PostThreadMessage, (clipdrop->dnd_thread_id, thread_wakeup_message, 0, 0));
 
@@ -667,11 +668,13 @@ _gdk_win32_dnd_thread_main (gpointer data)
 
   while (GetMessage (&msg, NULL, 0, 0))
     {
-      if (!dnd_queue_is_empty ())
+      GdkDisplay *display = gdk_display_get_default ();
+
+      if (!dnd_queue_is_empty (display))
         {
           while ((item = g_async_queue_try_pop (queue)) != NULL)
             {
-              decrement_dnd_queue_counter ();
+              decrement_dnd_queue_counter (display);
 
               if (item->item_type != GDK_WIN32_DND_THREAD_QUEUE_ITEM_DO_DRAG_DROP)
                 {
@@ -827,17 +830,17 @@ static enum_formats *enum_formats_new (GArray *formats);
  * Does not give a reference.
  */
 GdkDrag *
-_gdk_win32_find_drag_for_dest_hwnd (HWND dest_hwnd)
+gdk_win32_find_drag_for_dest_surface (GdkSurface *surface)
 {
   GHashTableIter               iter;
   GdkWin32Drag                *drag_win32;
   GdkWin32DnDThreadDoDragDrop *ddd;
-  GdkWin32Clipdrop            *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop            *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (surface));
 
   g_hash_table_iter_init (&iter, clipdrop->active_source_drags);
 
   while (g_hash_table_iter_next (&iter, (gpointer *) &drag_win32, (gpointer *) &ddd))
-    if (ddd->src_context->dest_window_handle == dest_hwnd)
+    if (ddd->src_context->dest_window_handle == GDK_SURFACE_HWND (surface))
       return GDK_DRAG (drag_win32);
 
   return NULL;
@@ -914,8 +917,8 @@ idropsourcenotify_dragentertarget (IDropSourceNotify *This,
   source_drag_context *ctx = (source_drag_context *) (((char *) This) - G_STRUCT_OFFSET (source_drag_context, idsn));
   GdkWin32DnDEnterLeaveNotify *notify;
 
-  if (!dnd_queue_is_empty ())
-    process_dnd_queue (FALSE, 0, NULL);
+  if (!dnd_queue_is_empty (gdk_surface_get_display (GDK_WIN32_DRAG (ctx->drag)->drag_surface)))
+    process_dnd_queue (ctx->drag, FALSE, 0, NULL);
 
   GDK_NOTE (DND, g_print ("idropsourcenotify_dragentertarget %p (SDC %p) 0x%p\n", This, ctx, hwndTarget));
 
@@ -935,8 +938,8 @@ idropsourcenotify_dragleavetarget (IDropSourceNotify *This)
   source_drag_context *ctx = (source_drag_context *) (((char *) This) - G_STRUCT_OFFSET (source_drag_context, idsn));
   GdkWin32DnDEnterLeaveNotify *notify;
 
-  if (!dnd_queue_is_empty ())
-    process_dnd_queue (FALSE, 0, NULL);
+  if (!dnd_queue_is_empty (gdk_surface_get_display (GDK_WIN32_DRAG (ctx->drag)->drag_surface)))
+    process_dnd_queue (ctx->drag, FALSE, 0, NULL);
 
   GDK_NOTE (DND, g_print ("idropsourcenotify_dragleavetarget %p (SDC %p) 0x%p\n", This, ctx, ctx->dest_window_handle));
 
@@ -1037,8 +1040,8 @@ idropsource_querycontinuedrag (LPDROPSOURCE This,
 
   GDK_NOTE (DND, g_print ("idropsource_querycontinuedrag %p esc=%d keystate=0x%lx with state %d\n", This, fEscapePressed, grfKeyState, ctx->util_data.state));
 
-  if (!dnd_queue_is_empty ())
-    process_dnd_queue (FALSE, 0, NULL);
+  if (!dnd_queue_is_empty (gdk_surface_get_display (GDK_WIN32_DRAG (ctx->drag)->drag_surface)))
+    process_dnd_queue (ctx->drag, FALSE, 0, NULL);
 
   GDK_NOTE (DND, g_print ("idropsource_querycontinuedrag state %d\n", ctx->util_data.state));
 
@@ -1074,14 +1077,13 @@ static gboolean
 give_feedback (gpointer user_data)
 {
   GdkWin32DnDThreadGiveFeedback *feedback = (GdkWin32DnDThreadGiveFeedback *) user_data;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkDrag *drag = GDK_DRAG (feedback->base.opaque_context);
+  GdkWin32Drag *drag_win32 = GDK_WIN32_DRAG (drag);
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (drag_win32->drag_surface));
   gpointer ddd = g_hash_table_lookup (clipdrop->active_source_drags, feedback->base.opaque_context);
 
   if (ddd)
     {
-      GdkDrag *drag = GDK_DRAG (feedback->base.opaque_context);
-      GdkWin32Drag *drag_win32 = GDK_WIN32_DRAG (drag);
-
       GDK_NOTE (DND, g_print ("gdk_dnd_handle_drag_status: 0x%p\n",
                               drag));
 
@@ -1102,8 +1104,8 @@ idropsource_givefeedback (LPDROPSOURCE This,
 
   GDK_NOTE (DND, g_print ("idropsource_givefeedback %p with drop effect %lu S_OK\n", This, dwEffect));
 
-  if (!dnd_queue_is_empty ())
-    process_dnd_queue (FALSE, 0, NULL);
+  if (!dnd_queue_is_empty (gdk_surface_get_display (GDK_WIN32_DRAG (ctx->drag)->drag_surface)))
+    process_dnd_queue (ctx->drag, FALSE, 0, NULL);
 
   feedback = g_new0 (GdkWin32DnDThreadGiveFeedback, 1);
   feedback->base.item_type = GDK_WIN32_DND_THREAD_QUEUE_ITEM_GIVE_FEEDBACK;
@@ -1241,8 +1243,8 @@ idataobject_getdata (LPDATAOBJECT This,
       return hr;
     }
 
-  if (!dnd_queue_is_empty ())
-    process_dnd_queue (FALSE, 0, NULL);
+  if (!dnd_queue_is_empty (gdk_surface_get_display (GDK_WIN32_DRAG (ctx->drag)->drag_surface)))
+    process_dnd_queue (ctx->drag, FALSE, 0, NULL);
 
   getdata = g_new0 (GdkWin32DnDThreadGetData, 1);
   getdata->base.item_type = GDK_WIN32_DND_THREAD_QUEUE_ITEM_GET_DATA;
@@ -1250,7 +1252,7 @@ idataobject_getdata (LPDATAOBJECT This,
   getdata->pair = *pair;
   g_idle_add_full (G_PRIORITY_DEFAULT, get_data_response, getdata, NULL);
 
-  if (!process_dnd_queue (TRUE, g_get_monotonic_time () + G_USEC_PER_SEC * 30, getdata))
+  if (!process_dnd_queue (ctx->drag, TRUE, g_get_monotonic_time () + G_USEC_PER_SEC * 30, getdata))
     return E_FAIL;
 
   if (getdata->produced_data_medium.tymed == TYMED_NULL)
@@ -1617,7 +1619,9 @@ data_object_new (GdkDrag *drag)
 
       GDK_NOTE (DND, g_print ("DataObject supports contentformat 0x%p (%s)\n", mime_types[i], mime_types[i]));
 
-      added_count = _gdk_win32_add_contentformat_to_pairs (mime_types[i], result->formats);
+      added_count = _gdk_win32_add_contentformat_to_pairs (gdk_win32_display_get_clipdrop (gdk_surface_get_display (GDK_WIN32_DRAG (drag)->drag_surface)),
+                                                           mime_types[i],
+                                                           result->formats);
 
       for (j = 0; j < added_count && result->formats->len - 1 - j >= 0; j++)
         GDK_NOTE (DND, g_print ("DataObject will support w32format 0x%x\n", g_array_index (result->formats, GdkWin32ContentFormatPair, j).w32format));
@@ -1673,7 +1677,7 @@ _gdk_win32_surface_drag_begin (GdkSurface         *surface,
 {
   GdkDrag *drag;
   GdkWin32Drag *drag_win32;
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (surface));
   double px, py;
   int x_root, y_root;
   GdkWin32DnDThreadDoDragDrop *ddd;
@@ -1728,7 +1732,7 @@ _gdk_win32_surface_drag_begin (GdkSurface         *surface,
     ddd->allowed_drop_effects |= DROPEFFECT_LINK;
 
   g_hash_table_replace (clipdrop->active_source_drags, g_object_ref (drag), ddd);
-  increment_dnd_queue_counter ();
+  increment_dnd_queue_counter (gdk_surface_get_display (drag_win32->drag_surface));
   g_async_queue_push (clipdrop->dnd_queue, ddd);
   API_CALL (PostThreadMessage, (clipdrop->dnd_thread_id, thread_wakeup_message, 0, 0));
 
@@ -1769,7 +1773,7 @@ send_source_state_update (GdkWin32Clipdrop    *clipdrop,
   status->base.item_type = GDK_WIN32_DND_THREAD_QUEUE_ITEM_UPDATE_DRAG_STATE;
   status->opaque_ddd = ddd;
   status->produced_util_data = drag_win32->util_data;
-  increment_dnd_queue_counter ();
+  increment_dnd_queue_counter (gdk_surface_get_display (drag_win32->drag_surface));
   g_async_queue_push (clipdrop->dnd_queue, status);
   API_CALL (PostThreadMessage, (clipdrop->dnd_thread_id, thread_wakeup_message, 0, 0));
 }
@@ -1779,7 +1783,7 @@ gdk_win32_drag_drop (GdkDrag *drag,
                      guint32  time_)
 {
   GdkWin32Drag *drag_win32 = GDK_WIN32_DRAG (drag);
-  GdkWin32Clipdrop *clipdrop = _gdk_win32_clipdrop_get ();
+  GdkWin32Clipdrop *clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (drag_win32->drag_surface));
   gpointer ddd;
 
   g_assert (check_drag_display_thread_status (drag, TRUE));
@@ -1894,7 +1898,7 @@ gdk_win32_drag_drop_done (GdkDrag  *drag,
   /* FIXME: This is temporary, until the code is fixed to ensure that
    * gdk_drag_finish () is called by GTK.
    */
-  clipdrop = _gdk_win32_clipdrop_get ();
+  clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (drag_win32->drag_surface));
   ddd = g_hash_table_lookup (clipdrop->active_source_drags, drag);
 
   if (success)
@@ -2052,7 +2056,7 @@ gdk_dnd_handle_motion_event (GdkDrag  *drag,
 
   key_state = manufacture_keystate_from_GMT (state);
 
-  clipdrop = _gdk_win32_clipdrop_get ();
+  clipdrop = gdk_win32_display_get_clipdrop (gdk_surface_get_display (event->surface));
 
   GDK_NOTE (DND, g_print ("Post WM_MOUSEMOVE keystate=%lu\n", key_state));
 

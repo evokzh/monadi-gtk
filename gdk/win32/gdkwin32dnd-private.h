@@ -91,9 +91,9 @@ struct _GdkWin32DragClass
 };
 
 
-gpointer _gdk_win32_dnd_thread_main         (gpointer         data);
+gpointer _gdk_win32_dnd_thread_main           (gpointer    data);
 
-GdkDrag *_gdk_win32_find_drag_for_dest_hwnd (HWND             dest_hwnd);
+GdkDrag *gdk_win32_find_drag_for_dest_surface (GdkSurface *surface);
 
 
 G_END_DECLS
