@@ -450,10 +450,8 @@ run_node_test (gconstpointer data)
 
   if (repeat)
     {
-      GskRenderNode *node2;
-      GdkPixbuf *pixbuf, *pixbuf2, *pixbuf3;
+      GskRenderNode *node2, *texture_node, *reference_node;
       GdkTexture *repeated_reference;
-      int width, height;
       graphene_rect_t node_bounds;
       graphene_rect_t bounds;
 
@@ -473,31 +471,10 @@ run_node_test (gconstpointer data)
       rendered_texture = gsk_renderer_render_texture (renderer, node2, NULL);
       save_image (rendered_texture, test->node_file, "repeated", ".out.png");
 
-      pixbuf = pixbuf_new_from_texture (reference_texture);
-
-      width = gdk_pixbuf_get_width (pixbuf);
-      height = gdk_pixbuf_get_height (pixbuf);
-      pixbuf2 = gdk_pixbuf_new (gdk_pixbuf_get_colorspace (pixbuf),
-                                gdk_pixbuf_get_has_alpha (pixbuf),
-                                gdk_pixbuf_get_bits_per_sample (pixbuf),
-                                width * 4,
-                                height * 4);
-
-      for (int i = 0; i < 4; i++)
-        {
-          for (int j = 0; j < 4; j++)
-            {
-              gdk_pixbuf_copy_area (pixbuf, 0, 0, width, height, pixbuf2, i * width,  j * height);
-            }
-        }
-
-      pixbuf3 = gdk_pixbuf_new_subpixbuf (pixbuf2, width / 2, height / 2, MIN (1000, 3 * width), MIN (1000, 3 * height));
-
-      repeated_reference = gdk_texture_new_for_pixbuf (pixbuf3);
-
-      g_object_unref (pixbuf3);
-      g_object_unref (pixbuf2);
-      g_object_unref (pixbuf);
+      texture_node = gsk_texture_node_new (reference_texture,
+                                           &node_bounds);
+      reference_node = gsk_repeat_node_new (&bounds, texture_node, &node_bounds);
+      repeated_reference = gsk_renderer_render_texture (renderer, reference_node, NULL);
 
       save_image (repeated_reference, test->node_file, "repeated", ".ref.png");
 
@@ -513,6 +490,8 @@ run_node_test (gconstpointer data)
       g_clear_object (&rendered_texture);
       g_clear_object (&repeated_reference);
       gsk_render_node_unref (node2);
+      gsk_render_node_unref (reference_node);
+      gsk_render_node_unref (texture_node);
     }
 
   if (rotate)
