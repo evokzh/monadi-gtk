@@ -322,28 +322,17 @@ gdk_mipmap_ ## DataType ## _ ## n_units (guchar       *dest, \
                                          gsize         src_height, \
                                          guint         lod_level) \
 { \
-  gsize y_dest, y, x_dest, x, i; \
+  gsize y_dest, x_dest, i; \
   gsize n = 1 << lod_level; \
 \
   for (y_dest = 0; y_dest < src_height; y_dest += n) \
     { \
       DataType *dest_data = (DataType *) dest; \
+      const DataType *src_data = (const DataType *) src; \
       for (x_dest = 0; x_dest < src_width; x_dest += n) \
         { \
-          SumType tmp[n_units] = { 0, }; \
-\
-          for (y = 0; y < MIN (n, src_height - y_dest); y++) \
-            { \
-              const DataType *src_data = (const DataType *) (src + y * src_stride); \
-              for (x = 0; x < MIN (n, src_width - x_dest); x++) \
-                { \
-                  for (i = 0; i < n_units; i++) \
-                    tmp[i] += src_data[n_units * (x_dest + x) + i]; \
-                } \
-            } \
-\
           for (i = 0; i < n_units; i++) \
-            *dest_data++ = tmp[i] / (x * y); \
+            *dest_data++ = src_data[x_dest * n_units + i]; \
         } \
       dest += dest_stride; \
       src += src_stride * n; \
